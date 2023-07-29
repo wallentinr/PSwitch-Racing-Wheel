@@ -1,5 +1,5 @@
 /*
-Nintendo Switch Fightstick - Proof-of-Concept
+Nintendo Driving Wheel controller
 
 Based on the LUFA library's Low-Level Joystick Demo
 	(C) Dean Camera
@@ -24,75 +24,80 @@ these buttons for our use.
  *  is responsible for the initial application hardware configuration.
  */
 
+#include <LUFA/Drivers/Peripheral/Serial.h>
 #include "Joystick.h"
 
-/*
-The following ButtonMap variable defines all possible buttons within the
-original 13 bits of space, along with attempting to investigate the remaining
-3 bits that are 'unused'. This is what led to finding that the 'Capture'
-button was operational on the stick.
+uint8_t target = RELEASE;
+uint16_t command;
+
+uint8_t lastLX = STICK_CENTER;
+uint8_t lastLY = STICK_CENTER;
+uint8_t firstButtons = 0;
+uint8_t secondButtons = 0;
+
+
+/* Data will come as 
+	Byte 0: which type of data, analog(241, 240) or digital(242)
+	Byte 1: 
+	 - if analog: the analog data
+	 - if digital: the first 8 buttons
+	Byte 2: only digital, second 8 buttons
 */
-uint16_t ButtonMap[16] = {
-	0x01,
-	0x02,
-	0x04,
-	0x08,
-	0x10,
-	0x20,
-	0x40,
-	0x80,
-	0x100,
-	0x200,
-	0x400,
-	0x800,
-	0x1000,
-	0x2000,
-	0x4000,
-	0x8000,
-};
+void parseLine(char *line, uint32_t count) {
+	char t[8];
+	char c[16];
+	uint8_t* data = (uint8_t*)line;
 
-/*** Debounce ****
-The following is some -really bad- debounce code. I have a more robust library
-that I've used in other personal projects that would be a much better use
-here, especially considering that this is a stick indented for use with arcade
-fighters.
+	if(data[0] == 241) { // Left joystick
+		lastLX = data[1];
+	} else if(data[0] == 240) // Right Joystick
+	{
+		// No right joystick data on controller
+	
+	} else if(data[0] == 242) { // Buttons
+		if(data[1] == 3) {	// No data on the first buttons
+			firstButtons = 0;
+		} else {
 
-This code exists solely to actually test on. This will eventually be replaced.
-**** Debounce ***/
-// Quick debounce hackery!
-// We're going to capture each port separately and store the contents into a 32-bit value.
-uint32_t pb_debounce = 0;
-uint32_t pd_debounce = 0;
+			firstButtons = data[1];
+		}
 
-// We also need a port state capture. We'll use a 16-bit value for this.
-uint16_t bd_state = 0;
+		if(data[2] == 3) { // No data on the second buttons
+			secondButtons = 0;
+		} else {
+			secondButtons = data[2];
+		}
+	}
+}
 
-// We'll also give us some useful macros here.
-#define PINB_DEBOUNCED ((bd_state >> 0) & 0xFF)
-#define PIND_DEBOUNCED ((bd_state >> 8) & 0xFF) 
+/* Parse characters on RX line until newline and then parse word */
+#define MAX_BUFFER 1024
+char b[MAX_BUFFER];
+uint8_t l = 0;
+ISR(USART1_RX_vect) {
+	char c = fgetc(stdin);
+	if (Serial_IsSendReady()) {
+		// printf("%c", c);
+	}
+	if (c == '\n') {
 
-// So let's do some debounce! Lazily, and really poorly.
-void debounce_ports(void) {
-	// We'll shift the current value of the debounce down one set of 8 bits. We'll also read in the state of the pins.
-	pb_debounce = (pb_debounce << 8) + PINB;
-	pd_debounce = (pd_debounce << 8) + PIND;
-
-	// We'll then iterate through a simple for loop.
-	for (int i = 0; i < 8; i++) {
-		if ((pb_debounce & (0x1010101 << i)) == (0x1010101 << i)) // wat
-			bd_state |= (1 << i);
-		else if ((pb_debounce & (0x1010101 << i)) == (0))
-			bd_state &= ~(uint16_t)(1 << i);
-
-		if ((pd_debounce & (0x1010101 << i)) == (0x1010101 << i))
-			bd_state |= (1 << (8 + i));
-		else if ((pd_debounce & (0x1010101 << i)) == (0))
-			bd_state &= ~(uint16_t)(1 << (8 + i));
+		parseLine(b, l);
+		l = 0;
+		memset(b, 0, sizeof(b));
+	} else if (c != '\r' && l < MAX_BUFFER) {
+		// printf("%c ", c);
+		b[l++] = c;
 	}
 }
 
 // Main entry point.
 int main(void) {
+  Serial_Init(9600, false);
+  Serial_CreateStream(NULL);
+
+  sei();
+  UCSR1B |= (1 << RXCIE1);
+
 	// We'll start by performing hardware and peripheral setup.
 	SetupHardware();
 	// We'll then enable global interrupts for our use.
@@ -104,9 +109,6 @@ int main(void) {
 		HID_Task();
 		// We also need to run the main USB management task.
 		USB_USBTask();
-		// As part of this loop, we'll also run our bad debounce code.
-		// Optimally, we should replace this with something that fires on a timer.
-		debounce_ports();
 	}
 }
 
@@ -120,12 +122,6 @@ void SetupHardware(void) {
 	clock_prescale_set(clock_div_1);
 	// We can then initialize our hardware and peripherals, including the USB stack.
 
-	// Both PORTD and PORTB will be used for handling the buttons and stick.
-	DDRD  &= ~0xFF;
-	PORTD |=  0xFF;
-
-	DDRB  &= ~0xFF;
-	PORTB |=  0xFF;
 	// The USB stack should be initialized last.
 	USB_Init();
 }
@@ -236,61 +232,85 @@ void HID_Task(void) {
 
 // Prepare the next report for the host.
 void GetNextReport(USB_JoystickReport_Input_t* const ReportData) {
-	// All of this code here is handled -really poorly-, and should be replaced with something a bit more production-worthy.
-	uint16_t buf_button   = 0x00;
-	uint8_t  buf_joystick = 0x00;
 
 	/* Clear the report contents */
 	memset(ReportData, 0, sizeof(USB_JoystickReport_Input_t));
+	ReportData->LX = STICK_CENTER;
+	ReportData->LY = STICK_CENTER;
+	ReportData->RX = STICK_CENTER;
+	ReportData->RY = STICK_CENTER;
+	ReportData->HAT = HAT_CENTER;
+	ReportData->Button = SWITCH_RELEASE;
 
-	buf_button   = (~PIND_DEBOUNCED & 0xFF) << (~PINB_DEBOUNCED & 0x08 ? 8 : 0);
-	buf_joystick = (~PINB_DEBOUNCED & 0xFF);
 
-	for (int i = 0; i < 16; i++) {
-		if (buf_button & (1 << i))
-			ReportData->Button |= ButtonMap[i];
+
+	ReportData->LX = lastLX;
+
+	if((firstButtons>>2) & 0x01) {
+		// printf("BUTTON: UNKNOWN\n\r");
+	} 
+	
+	if((firstButtons>>3) & 0x01) {
+		// printf("BUTTON: START\n\r");
+		ReportData->Button |= SWITCH_START;
+	}
+	
+	if(((firstButtons>>4) & 0x0f) == 1) {
+		// printf("HAT: UP\n\r");
+		ReportData->HAT = HAT_TOP;
+		
+	} else if(((firstButtons>>4) & 0x0f) == 2) {
+		// printf("HAT: RIGHT\n\r");
+		ReportData->HAT = HAT_RIGHT;
+	} else if(((firstButtons>>4) & 0x0f) == 4) {
+		ReportData->HAT = HAT_BOTTOM;
+		// printf("HAT: DOWN\n\r");
+	} else if(((firstButtons>>4) & 0x0f) == 8) {
+		ReportData->HAT = HAT_LEFT;
+		// printf("HAT: LEFT\n\r");
 	}
 
-	if (buf_joystick & 0x10)
-		ReportData->LX = 0;
-	else if (buf_joystick & 0x20)
-		ReportData->LX = 255;
-	else
-		ReportData->LX = 128;
+	if(((secondButtons>>7) & 0x01) && ((secondButtons>>6) & 0x01)) {
+		ReportData->Button |= SWITCH_L;
+		ReportData->Button |= SWITCH_A;
 
-	if (buf_joystick & 0x80)
-		ReportData->LY = 0;
-	else if (buf_joystick & 0x40)
-		ReportData->LY = 255;
-	else
-		ReportData->LY = 128;
+	} else {
+		if((secondButtons>>6) & 0x01) {
+			// printf("HAT: X\n\r");
+			ReportData->Button |= SWITCH_A;
 
-	switch(buf_joystick & 0xF0) {
-		case 0x80: // Top
-			ReportData->HAT = 0x00;
-			break;
-		case 0xA0: // Top-Right
-			ReportData->HAT = 0x01;
-			break;
-		case 0x20: // Right
-			ReportData->HAT = 0x02;
-			break;
-		case 0x60: // Bottom-Right
-			ReportData->HAT = 0x03;
-			break;
-		case 0x40: // Bottom
-			ReportData->HAT = 0x04;
-			break;
-		case 0x50: // Bottom-Left
-			ReportData->HAT = 0x05;
-			break;
-		case 0x10: // Left
-			ReportData->HAT = 0x06;
-			break;
-		case 0x90: // Top-Left
-			ReportData->HAT = 0x07;
-			break;
-		default:
-			ReportData->HAT = 0x08;
+		}
+		
+		if((secondButtons>>7) & 0x01) {
+			// printf("HAT: SQUARE\n\r");
+			ReportData->Button |= SWITCH_B;
+		}
+
 	}
+
+	if((secondButtons>>2) & 0x01) {
+		// printf("BUTTON: L\n\r");
+		ReportData->Button |= SWITCH_L;
+
+	} 
+	
+	if((secondButtons>>3) & 0x01) {
+		// printf("BUTTON: R\n\r");
+		ReportData->Button |= SWITCH_R;
+
+	}
+	
+	if((secondButtons>>4) & 0x01) {
+		// printf("HAT: TRIANGLE\n\r");
+		ReportData->Button |= SWITCH_X;
+
+	}
+	
+	if((secondButtons>>5) & 0x01) {
+		// printf("HAT: CIRCLE\n\r");
+		ReportData->Button |= SWITCH_Y;
+
+	}
+	
 }
+// vim: noexpandtab
